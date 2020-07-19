@@ -24,6 +24,7 @@ import (
 	gcp_secretmanager "github.com/dapr/components-contrib/secretstores/gcp/secretmanager"
 	"github.com/dapr/components-contrib/secretstores/hashicorp/vault"
 	sercetstores_kubernetes "github.com/dapr/components-contrib/secretstores/kubernetes"
+	localsecretstore "github.com/dapr/components-contrib/secretstores/local"
 	secretstores_loader "github.com/dapr/dapr/pkg/components/secretstores"
 
 	// State Stores
@@ -40,6 +41,7 @@ import (
 	"github.com/dapr/components-contrib/state/hazelcast"
 	"github.com/dapr/components-contrib/state/memcached"
 	"github.com/dapr/components-contrib/state/mongodb"
+	"github.com/dapr/components-contrib/state/postgresql"
 	state_redis "github.com/dapr/components-contrib/state/redis"
 	"github.com/dapr/components-contrib/state/sqlserver"
 	"github.com/dapr/components-contrib/state/zookeeper"
@@ -47,12 +49,15 @@ import (
 
 	// Pub/Sub
 	pubs "github.com/dapr/components-contrib/pubsub"
+	pubsub_snssqs "github.com/dapr/components-contrib/pubsub/aws/snssqs"
 	pubsub_eventhubs "github.com/dapr/components-contrib/pubsub/azure/eventhubs"
 	"github.com/dapr/components-contrib/pubsub/azure/servicebus"
 	pubsub_gcp "github.com/dapr/components-contrib/pubsub/gcp/pubsub"
 	pubsub_hazelcast "github.com/dapr/components-contrib/pubsub/hazelcast"
 	pubsub_kafka "github.com/dapr/components-contrib/pubsub/kafka"
+	pubsub_mqtt "github.com/dapr/components-contrib/pubsub/mqtt"
 	"github.com/dapr/components-contrib/pubsub/nats"
+	pubsub_pulsar "github.com/dapr/components-contrib/pubsub/pulsar"
 	"github.com/dapr/components-contrib/pubsub/rabbitmq"
 	pubsub_redis "github.com/dapr/components-contrib/pubsub/redis"
 	pubsub_loader "github.com/dapr/dapr/pkg/components/pubsub"
@@ -64,11 +69,11 @@ import (
 	"github.com/dapr/components-contrib/exporters/zipkin"
 	exporters_loader "github.com/dapr/dapr/pkg/components/exporters"
 
-	// Service Discovery
-	"github.com/dapr/components-contrib/servicediscovery"
-	servicediscovery_kubernetes "github.com/dapr/components-contrib/servicediscovery/kubernetes"
-	"github.com/dapr/components-contrib/servicediscovery/mdns"
-	servicediscovery_loader "github.com/dapr/dapr/pkg/components/servicediscovery"
+	// Name resolutions
+	nr "github.com/dapr/components-contrib/nameresolution"
+	nr_kubernetes "github.com/dapr/components-contrib/nameresolution/kubernetes"
+	nr_mdns "github.com/dapr/components-contrib/nameresolution/mdns"
+	nr_loader "github.com/dapr/dapr/pkg/components/nameresolution"
 
 	// Bindings
 	"github.com/dapr/components-contrib/bindings"
@@ -84,6 +89,7 @@ import (
 	"github.com/dapr/components-contrib/bindings/azure/servicebusqueues"
 	"github.com/dapr/components-contrib/bindings/azure/signalr"
 	"github.com/dapr/components-contrib/bindings/azure/storagequeues"
+	"github.com/dapr/components-contrib/bindings/cron"
 	"github.com/dapr/components-contrib/bindings/gcp/bucket"
 	"github.com/dapr/components-contrib/bindings/gcp/pubsub"
 	"github.com/dapr/components-contrib/bindings/http"
@@ -135,6 +141,9 @@ func main() {
 			secretstores_loader.New("gcp.secretmanager", func() secretstores.SecretStore {
 				return gcp_secretmanager.NewSecreteManager(logContrib)
 			}),
+			secretstores_loader.New("local.localsecretstore", func() secretstores.SecretStore {
+				return localsecretstore.NewLocalSecretStore(logContrib)
+			}),
 		),
 		runtime.WithStates(
 			state_loader.New("redis", func() state.Store {
@@ -166,6 +175,9 @@ func main() {
 			}),
 			state_loader.New("gcp.firestore", func() state.Store {
 				return firestore.NewFirestoreStateStore(logContrib)
+			}),
+			state_loader.New("postgresql", func() state.Store {
+				return postgresql.NewPostgreSQLStateStore(logContrib)
 			}),
 			state_loader.New("sqlserver", func() state.Store {
 				return sqlserver.NewSQLServerStateStore(logContrib)
@@ -208,6 +220,15 @@ func main() {
 			pubsub_loader.New("kafka", func() pubs.PubSub {
 				return pubsub_kafka.NewKafka(logContrib)
 			}),
+			pubsub_loader.New("snssqs", func() pubs.PubSub {
+				return pubsub_snssqs.NewSnsSqs(logContrib)
+			}),
+			pubsub_loader.New("mqtt", func() pubs.PubSub {
+				return pubsub_mqtt.NewMQTTPubSub(logContrib)
+			}),
+			pubsub_loader.New("pulsar", func() pubs.PubSub {
+				return pubsub_pulsar.NewPulsar(logContrib)
+			}),
 		),
 		runtime.WithExporters(
 			exporters_loader.New("zipkin", func() exporters.Exporter {
@@ -220,12 +241,12 @@ func main() {
 				return native.NewNativeExporter(logContrib)
 			}),
 		),
-		runtime.WithServiceDiscovery(
-			servicediscovery_loader.New("mdns", func() servicediscovery.Resolver {
-				return mdns.NewMDNSResolver(logContrib)
+		runtime.WithNameResolutions(
+			nr_loader.New("mdns", func() nr.Resolver {
+				return nr_mdns.NewResolver(logContrib)
 			}),
-			servicediscovery_loader.New("kubernetes", func() servicediscovery.Resolver {
-				return servicediscovery_kubernetes.NewKubernetesResolver(logContrib)
+			nr_loader.New("kubernetes", func() nr.Resolver {
+				return nr_kubernetes.NewResolver(logContrib)
 			}),
 		),
 		runtime.WithInputBindings(
@@ -264,6 +285,9 @@ func main() {
 			}),
 			bindings_loader.NewInput("twitter", func() bindings.InputBinding {
 				return twitter.NewTwitter(logContrib)
+			}),
+			bindings_loader.NewInput("cron", func() bindings.InputBinding {
+				return cron.NewCron(logContrib)
 			}),
 		),
 		runtime.WithOutputBindings(
@@ -329,6 +353,12 @@ func main() {
 			}),
 			bindings_loader.NewOutput("azure.eventgrid", func() bindings.OutputBinding {
 				return eventgrid.NewAzureEventGrid(logContrib)
+			}),
+			bindings_loader.NewOutput("cron", func() bindings.OutputBinding {
+				return cron.NewCron(logContrib)
+			}),
+			bindings_loader.NewOutput("twitter", func() bindings.OutputBinding {
+				return twitter.NewTwitter(logContrib)
 			}),
 		),
 		runtime.WithHTTPMiddleware(

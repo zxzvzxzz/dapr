@@ -6,8 +6,8 @@
 package diagnostics
 
 import (
-	"context"
 	"fmt"
+	"net/http"
 	"net/textproto"
 	"regexp"
 	"strconv"
@@ -18,6 +18,7 @@ import (
 	"github.com/valyala/fasthttp"
 	"go.opencensus.io/trace"
 	"go.opencensus.io/trace/tracestate"
+	"google.golang.org/grpc/codes"
 )
 
 // We have leveraged the code from opencensus-go plugin to adhere the w3c trace context.
@@ -33,52 +34,64 @@ const (
 
 var trimOWSRegExp = regexp.MustCompile(trimOWSRegexFmt)
 
-// SetTracingInHTTPMiddleware sets the trace context or starts the trace client span based on request
-func SetTracingInHTTPMiddleware(next fasthttp.RequestHandler, appID string, spec config.TracingSpec) fasthttp.RequestHandler {
+// HTTPTraceMiddleware sets the trace context or starts the trace client span based on request
+func HTTPTraceMiddleware(next fasthttp.RequestHandler, appID string, spec config.TracingSpec) fasthttp.RequestHandler {
 	return func(ctx *fasthttp.RequestCtx) {
-		sc := GetSpanContextFromRequestContext(ctx, spec)
 		path := string(ctx.Request.URI().Path())
-
-		// 1. check if tracing is enabled or not, and if request is health request
-		// 2. if tracing is disabled or health request, set the trace context and call the handler
-		// 3. if tracing is enabled, start the client or server spans based on the request and call the handler with appropriate span context
-		if isHealthzRequest(path) || !diag_utils.IsTracingEnabled(spec.SamplingRate) {
-			SpanContextToRequest(sc, &ctx.Request)
+		if isHealthzRequest(path) {
 			next(ctx)
-		} else {
-			method := ctx.Request.Header.Method()
-			spanName := fmt.Sprintf("%s:%s", method, path)
-
-			newCtx := NewContext((context.Context)(ctx), sc)
-			_, span := StartTracingClientSpanFromHTTPContext(newCtx, &ctx.Request, spanName, spec)
-			SpanContextToRequest(span.SpanContext(), &ctx.Request)
-
-			next(ctx)
-
-			UpdateSpanStatus(span, spanName, ctx.Response.StatusCode())
-			span.End()
+			return
 		}
+
+		ctx, span := startTracingClientSpanFromHTTPContext(ctx, path, spec)
+		next(ctx)
+
+		// Add span attributes only if it is sampled, which reduced the perf impact.
+		if span.SpanContext().TraceOptions.IsSampled() {
+			AddAttributesToSpan(span, userDefinedHTTPHeaders(ctx))
+			spanAttr := spanAttributesMapFromHTTPContext(ctx)
+			AddAttributesToSpan(span, spanAttr)
+
+			// Correct the span name based on API.
+			if sname, ok := spanAttr[daprAPISpanNameInternal]; ok {
+				span.SetName(sname)
+			}
+		}
+
+		// Check if response has traceparent header and add if absent
+		if ctx.Response.Header.Peek(traceparentHeader) == nil {
+			span = diag_utils.SpanFromContext(ctx)
+			SpanContextToHTTPHeaders(span.SpanContext(), ctx.Response.Header.Set)
+		}
+
+		UpdateSpanStatusFromHTTPStatus(span, ctx.Response.StatusCode())
+		span.End()
 	}
 }
 
-// StartTracingClientSpanFromHTTPContext creates a client span before invoking http method call
-func StartTracingClientSpanFromHTTPContext(ctx context.Context, req *fasthttp.Request, method string, spec config.TracingSpec) (context.Context, *trace.Span) {
-	var span *trace.Span
-	ctx, span = startTracingSpanInternal(ctx, method, spec.SamplingRate, trace.SpanKindClient)
+// userDefinedHTTPHeaders returns dapr- prefixed header from incoming metdata.
+// Users can add dapr- prefixed headers that they want to see in span attributes.
+func userDefinedHTTPHeaders(reqCtx *fasthttp.RequestCtx) map[string]string {
+	var m = map[string]string{}
 
-	addAnnotationsToSpan(req, span)
+	reqCtx.Request.Header.VisitAll(func(key []byte, value []byte) {
+		k := strings.ToLower(string(key))
+		if strings.HasPrefix(k, daprHeaderPrefix) {
+			m[k] = string(value)
+		}
+	})
 
+	return m
+}
+
+func startTracingClientSpanFromHTTPContext(ctx *fasthttp.RequestCtx, spanName string, spec config.TracingSpec) (*fasthttp.RequestCtx, *trace.Span) {
+	sc, _ := SpanContextFromRequest(&ctx.Request)
+	probSamplerOption := diag_utils.TraceSampler(spec.SamplingRate)
+	kindOption := trace.WithSpanKind(trace.SpanKindClient)
+
+	_, span := trace.StartSpanWithRemoteParent(ctx, spanName, sc, kindOption, probSamplerOption)
+	diag_utils.SpanToFastHTTPContext(ctx, span)
 	return ctx, span
-}
-
-func GetSpanContextFromRequestContext(ctx *fasthttp.RequestCtx, spec config.TracingSpec) trace.SpanContext {
-	spanContext, ok := SpanContextFromRequest(&ctx.Request)
-
-	if !ok {
-		spanContext = GetDefaultSpanContext(spec)
-	}
-
-	return spanContext
 }
 
 // SpanContextFromRequest extracts a span context from incoming requests.
@@ -87,44 +100,57 @@ func SpanContextFromRequest(req *fasthttp.Request) (sc trace.SpanContext, ok boo
 	if !ok {
 		return trace.SpanContext{}, false
 	}
-
-	sc, ok = SpanContextFromString(h)
-
+	sc, ok = SpanContextFromW3CString(h)
 	if ok {
 		sc.Tracestate = tracestateFromRequest(req)
 	}
 	return sc, ok
 }
 
-// SpanContextToRequest modifies the given request to include traceparent and tracestate headers.
-func SpanContextToRequest(sc trace.SpanContext, req *fasthttp.Request) {
-	h := SpanContextToString(sc)
-	req.Header.Set(traceparentHeader, h)
-	tracestateToRequest(sc, req)
-}
-
-func addAnnotationsToSpan(req *fasthttp.Request, span *trace.Span) {
-	req.Header.VisitAll(func(key []byte, value []byte) {
-		headerKey := string(key)
-		headerKey = strings.ToLower(headerKey)
-		if strings.HasPrefix(headerKey, daprHeaderPrefix) {
-			span.AddAttributes(trace.StringAttribute(headerKey, string(value)))
-		}
-	})
-}
-
 func isHealthzRequest(name string) bool {
 	return strings.Contains(name, "/healthz")
 }
 
-// UpdateSpanStatus updates trace span status based on response code
-func UpdateSpanStatus(span *trace.Span, spanName string, code int) {
+// UpdateSpanStatusFromHTTPStatus updates trace span status based on response code
+func UpdateSpanStatusFromHTTPStatus(span *trace.Span, code int) {
 	if span != nil {
-		span.SetStatus(trace.Status{
-			Code:    projectStatusCode(code),
-			Message: fmt.Sprintf("method %s status - %s", spanName, strconv.Itoa(code)),
-		})
+		span.SetStatus(traceStatusFromHTTPCode(code))
 	}
+}
+
+// https://github.com/open-telemetry/opentelemetry-specification/blob/master/specification/trace/semantic_conventions/http.md#status
+func traceStatusFromHTTPCode(httpCode int) trace.Status {
+	var code codes.Code = codes.Unknown
+	switch httpCode {
+	case http.StatusUnauthorized:
+		code = codes.Unauthenticated
+	case http.StatusForbidden:
+		code = codes.PermissionDenied
+	case http.StatusNotFound:
+		code = codes.NotFound
+	case http.StatusTooManyRequests:
+		code = codes.ResourceExhausted
+	case http.StatusNotImplemented:
+		code = codes.Unimplemented
+	case http.StatusServiceUnavailable:
+		code = codes.Unavailable
+	case http.StatusGatewayTimeout:
+		code = codes.DeadlineExceeded
+	}
+
+	if code == codes.Unknown {
+		if httpCode >= 100 && httpCode < 300 {
+			code = codes.OK
+		} else if httpCode >= 300 && httpCode < 400 {
+			code = codes.DeadlineExceeded
+		} else if httpCode >= 400 && httpCode < 500 {
+			code = codes.InvalidArgument
+		} else if httpCode >= 500 {
+			code = codes.Internal
+		}
+	}
+
+	return trace.Status{Code: int32(code), Message: code.String()}
 }
 
 func getRequestHeader(req *fasthttp.Request, name string) (string, bool) {
@@ -138,38 +164,21 @@ func getRequestHeader(req *fasthttp.Request, name string) (string, bool) {
 
 func tracestateFromRequest(req *fasthttp.Request) *tracestate.Tracestate {
 	h, _ := getRequestHeader(req, tracestateHeader)
-	if h == "" {
-		return nil
-	}
-
-	entries := make([]tracestate.Entry, 0, len(h))
-	pairs := strings.Split(h, ",")
-	hdrLenWithoutOWS := len(pairs) - 1 // Number of commas
-	for _, pair := range pairs {
-		matches := trimOWSRegExp.FindStringSubmatch(pair)
-		if matches == nil {
-			return nil
-		}
-		pair = matches[1]
-		hdrLenWithoutOWS += len(pair)
-		if hdrLenWithoutOWS > maxTracestateLen {
-			return nil
-		}
-		kv := strings.Split(pair, "=")
-		if len(kv) != 2 {
-			return nil
-		}
-		entries = append(entries, tracestate.Entry{Key: kv[0], Value: kv[1]})
-	}
-	ts, err := tracestate.New(nil, entries...)
-	if err != nil {
-		return nil
-	}
-
-	return ts
+	return TraceStateFromW3CString(h)
 }
 
-func tracestateToRequest(sc trace.SpanContext, req *fasthttp.Request) {
+// SpanContextToHTTPHeaders adds the spancontext in traceparent and tracestate headers.
+func SpanContextToHTTPHeaders(sc trace.SpanContext, setHeader func(string, string)) {
+	// if sc is empty context, no ops.
+	if (trace.SpanContext{}) == sc {
+		return
+	}
+	h := SpanContextToW3CString(sc)
+	setHeader(traceparentHeader, h)
+	tracestateToHeader(sc, setHeader)
+}
+
+func tracestateToHeader(sc trace.SpanContext, setHeader func(string, string)) {
 	var pairs = make([]string, 0, len(sc.Tracestate.Entries()))
 	if sc.Tracestate != nil {
 		for _, entry := range sc.Tracestate.Entries() {
@@ -178,7 +187,116 @@ func tracestateToRequest(sc trace.SpanContext, req *fasthttp.Request) {
 		h := strings.Join(pairs, ",")
 
 		if h != "" && len(h) <= maxTracestateLen {
-			req.Header.Set(tracestateHeader, h)
+			setHeader(tracestateHeader, h)
 		}
 	}
+}
+
+func getContextValue(ctx *fasthttp.RequestCtx, key string) string {
+	if ctx.UserValue(key) == nil {
+		return ""
+	}
+	return ctx.UserValue(key).(string)
+}
+
+func getAPIComponent(apiPath string) (string, string) {
+	// Dapr API reference : https://github.com/dapr/docs/tree/master/reference/api
+	// example : apiPath /v1.0/state/statestore
+	if apiPath == "" {
+		return "", ""
+	}
+
+	// Split up to 4 delimiters in '/v1.0/state/statestore/key' to get component api type and value
+	var tokens = strings.SplitN(apiPath, "/", 4)
+	if len(tokens) < 3 {
+		return "", ""
+	}
+
+	// return 'state', 'statestore' from the parsed tokens in apiComponent type
+	return tokens[1], tokens[2]
+}
+
+func spanAttributesMapFromHTTPContext(ctx *fasthttp.RequestCtx) map[string]string {
+	// Span Attribute reference https://github.com/open-telemetry/opentelemetry-specification/tree/master/specification/trace/semantic_conventions
+	path := string(ctx.Request.URI().Path())
+	method := string(ctx.Request.Header.Method())
+	statusCode := ctx.Response.StatusCode()
+
+	var m = map[string]string{}
+	_, componentType := getAPIComponent(path)
+
+	var dbType string
+	switch componentType {
+	case "state":
+		dbType = stateBuildingBlockType
+		m[dbInstanceSpanAttributeKey] = getContextValue(ctx, "storeName")
+
+	case "secrets":
+		dbType = secretBuildingBlockType
+		m[dbInstanceSpanAttributeKey] = getContextValue(ctx, "secretStoreName")
+
+	case "bindings":
+		dbType = bindingBuildingBlockType
+		m[dbInstanceSpanAttributeKey] = getContextValue(ctx, "name")
+
+	case "invoke":
+		m[gRPCServiceSpanAttributeKey] = daprGRPCServiceInvocationService
+		targetID := getContextValue(ctx, "id")
+		m[netPeerNameSpanAttributeKey] = targetID
+		m[daprAPISpanNameInternal] = fmt.Sprintf("CallLocal/%s/%s", targetID, getContextValue(ctx, "method"))
+
+	case "publish":
+		m[messagingSystemSpanAttributeKey] = pubsubBuildingBlockType
+		m[messagingDestinationSpanAttributeKey] = getContextValue(ctx, "topic")
+		m[messagingDestinationKindSpanAttributeKey] = messagingDestinationTopicKind
+
+	case "actors":
+		dbType = populateActorParams(ctx, m)
+	}
+
+	// Populate the rest of database attributes.
+	if _, ok := m[dbInstanceSpanAttributeKey]; ok {
+		m[dbTypeSpanAttributeKey] = dbType
+		m[dbStatementSpanAttributeKey] = fmt.Sprintf("%s %s", method, path)
+		m[dbURLSpanAttributeKey] = dbType
+	}
+
+	// Populate dapr original api attributes.
+	m[daprAPIProtocolSpanAttributeKey] = daprAPIHTTPSpanAttrValue
+	m[daprAPISpanAttributeKey] = fmt.Sprintf("%s %s", method, path)
+	m[daprAPIStatusCodeSpanAttributeKey] = strconv.Itoa(statusCode)
+
+	return m
+}
+
+func populateActorParams(ctx *fasthttp.RequestCtx, m map[string]string) string {
+	actorType := getContextValue(ctx, "actorType")
+	actorID := getContextValue(ctx, "actorId")
+	if actorType == "" || actorID == "" {
+		return ""
+	}
+
+	path := string(ctx.Request.URI().Path())
+	// Split up to 7 delimiters in '/v1.0/actors/{actorType}/{actorId}/method/{method}'
+	// to get component api type and value
+	var tokens = strings.SplitN(path, "/", 7)
+	if len(tokens) < 7 {
+		return ""
+	}
+
+	m[daprAPIActorTypeID] = fmt.Sprintf("%s.%s", actorType, actorID)
+
+	var dbType = ""
+	switch tokens[5] {
+	case "method":
+		m[gRPCServiceSpanAttributeKey] = daprGRPCServiceInvocationService
+		m[netPeerNameSpanAttributeKey] = m[daprAPIActorTypeID]
+		m[daprAPISpanNameInternal] = fmt.Sprintf("CallActor/%s/%s", actorType, getContextValue(ctx, "method"))
+
+	case "state":
+		dbType = stateBuildingBlockType
+		m[dbInstanceSpanAttributeKey] = "actor"
+	}
+
+	return dbType
 }

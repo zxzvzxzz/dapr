@@ -1,6 +1,6 @@
 global:
   registry: docker.io/daprio
-  tag: "0.7.1"
+  tag: "0.9.0"
   logAsJson: false
   imagePullPolicy: Always
   imagePullSecrets: ""
@@ -11,3 +11,4 @@ global:
     enabled: true
     workloadCertTTL: 24h
     allowedClockSkew: 15m
+  daprControlPlaneOs: linux

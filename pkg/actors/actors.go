@@ -20,6 +20,7 @@ import (
 	"github.com/dapr/dapr/pkg/config"
 	dapr_credentials "github.com/dapr/dapr/pkg/credentials"
 	diag "github.com/dapr/dapr/pkg/diagnostics"
+	diag_utils "github.com/dapr/dapr/pkg/diagnostics/utils"
 	"github.com/dapr/dapr/pkg/health"
 	"github.com/dapr/dapr/pkg/logger"
 	invokev1 "github.com/dapr/dapr/pkg/messaging/v1"
@@ -27,6 +28,7 @@ import (
 	commonv1pb "github.com/dapr/dapr/pkg/proto/common/v1"
 	internalv1pb "github.com/dapr/dapr/pkg/proto/internals/v1"
 	placementv1pb "github.com/dapr/dapr/pkg/proto/placement/v1"
+	"github.com/dapr/dapr/pkg/retry"
 	"github.com/dapr/dapr/pkg/runtime/security"
 	"github.com/mitchellh/mapstructure"
 	"google.golang.org/grpc"
@@ -36,8 +38,8 @@ import (
 )
 
 const (
-	daprSeparator             = "||"
-	callRemoteActorRetryCount = 3
+	daprSeparator        = "||"
+	metadataPartitionKey = "partitionKey"
 )
 
 var log = logger.NewLogger("dapr.runtime.actor")
@@ -208,7 +210,7 @@ func (a *actorsRuntime) startDeactivationTicker(interval, actorIdleTimeout time.
 			a.actorsTable.Range(func(key, value interface{}) bool {
 				actorInstance := value.(*actor)
 
-				if actorInstance.busy {
+				if actorInstance.isBusy() {
 					return true
 				}
 
@@ -246,7 +248,7 @@ func (a *actorsRuntime) Call(ctx context.Context, req *invokev1.InvokeMethodRequ
 	if a.isActorLocal(targetActorAddress, a.config.HostAddress, a.config.Port) {
 		resp, err = a.callLocalActor(ctx, req)
 	} else {
-		resp, err = a.callRemoteActorWithRetry(ctx, callRemoteActorRetryCount, a.callRemoteActor, targetActorAddress, appID, req)
+		resp, err = a.callRemoteActorWithRetry(ctx, retry.DefaultLinearRetryCount, retry.DefaultLinearBackoffInterval, a.callRemoteActor, targetActorAddress, appID, req)
 	}
 
 	if err != nil {
@@ -259,6 +261,7 @@ func (a *actorsRuntime) Call(ctx context.Context, req *invokev1.InvokeMethodRequ
 func (a *actorsRuntime) callRemoteActorWithRetry(
 	ctx context.Context,
 	numRetries int,
+	backoffInterval time.Duration,
 	fn func(ctx context.Context, targetAddress, targetID string, req *invokev1.InvokeMethodRequest) (*invokev1.InvokeMethodResponse, error),
 	targetAddress, targetID string, req *invokev1.InvokeMethodRequest) (*invokev1.InvokeMethodResponse, error) {
 	for i := 0; i < numRetries; i++ {
@@ -266,6 +269,7 @@ func (a *actorsRuntime) callRemoteActorWithRetry(
 		if err == nil {
 			return resp, nil
 		}
+		time.Sleep(backoffInterval)
 
 		code := status.Code(err)
 		if code == codes.Unavailable || code == codes.Unauthenticated {
@@ -284,21 +288,10 @@ func (a *actorsRuntime) callLocalActor(ctx context.Context, req *invokev1.Invoke
 	actorTypeID := req.Actor()
 	key := a.constructCompositeKey(actorTypeID.GetActorType(), actorTypeID.GetActorId())
 
-	val, _ := a.actorsTable.LoadOrStore(key, &actor{
-		lock:         &sync.RWMutex{},
-		busy:         true,
-		lastUsedTime: time.Now().UTC(),
-		busyCh:       make(chan bool, 1),
-	})
-
+	val, _ := a.actorsTable.LoadOrStore(key, newActor(actorTypeID.GetActorType(), actorTypeID.GetActorId()))
 	act := val.(*actor)
-	lock := act.lock
-	lock.Lock()
-	defer lock.Unlock()
-
-	act.busy = true
-	act.busyCh = make(chan bool, 1)
-	act.lastUsedTime = time.Now().UTC()
+	act.lock()
+	defer act.unLock()
 
 	// Replace method to actors method
 	req.Message().Method = fmt.Sprintf("actors/%s/%s/method/%s", actorTypeID.GetActorType(), actorTypeID.GetActorId(), req.Message().Method)
@@ -309,11 +302,6 @@ func (a *actorsRuntime) callLocalActor(ctx context.Context, req *invokev1.Invoke
 		req.Message().HttpExtension.Verb = commonv1pb.HTTPExtension_PUT
 	}
 	resp, err := a.appChannel.InvokeMethod(ctx, req)
-
-	if act.busy {
-		act.busy = false
-		close(act.busyCh)
-	}
 
 	if err != nil {
 		return nil, err
@@ -340,8 +328,8 @@ func (a *actorsRuntime) callRemoteActor(
 	// ctx, cancel := context.WithTimeout(ctx, time.Minute*1)
 	// defer cancel()
 
-	sc := diag.FromContext(ctx)
-	ctx = diag.AppendToOutgoingGRPCContext(ctx, sc)
+	span := diag_utils.SpanFromContext(ctx)
+	ctx = diag.SpanContextToGRPCMetadata(ctx, span.SpanContext())
 	client := internalv1pb.NewServiceInvocationClient(conn)
 	resp, err := client.CallActor(ctx, req.Proto())
 	if err != nil {
@@ -360,9 +348,14 @@ func (a *actorsRuntime) GetState(ctx context.Context, req *GetStateRequest) (*St
 	if a.store == nil {
 		return nil, errors.New("actors: state store does not exist or incorrectly configured")
 	}
+
+	partitionKey := a.constructCompositeKey(a.config.AppID, req.ActorType, req.ActorID)
+	metadata := map[string]string{metadataPartitionKey: partitionKey}
+
 	key := a.constructActorStateKey(req.ActorType, req.ActorID, req.Key)
 	resp, err := a.store.Get(&state.GetRequest{
-		Key: key,
+		Key:      key,
+		Metadata: metadata,
 	})
 	if err != nil {
 		return nil, err
@@ -378,6 +371,9 @@ func (a *actorsRuntime) TransactionalStateOperation(ctx context.Context, req *Tr
 		return errors.New("actors: state store does not exist or incorrectly configured")
 	}
 	requests := []state.TransactionalRequest{}
+	partitionKey := a.constructCompositeKey(a.config.AppID, req.ActorType, req.ActorID)
+	metadata := map[string]string{metadataPartitionKey: partitionKey}
+
 	for _, o := range req.Operations {
 		switch o.Operation {
 		case Upsert:
@@ -389,8 +385,9 @@ func (a *actorsRuntime) TransactionalStateOperation(ctx context.Context, req *Tr
 			key := a.constructActorStateKey(req.ActorType, req.ActorID, upsert.Key)
 			requests = append(requests, state.TransactionalRequest{
 				Request: state.SetRequest{
-					Key:   key,
-					Value: upsert.Value,
+					Key:      key,
+					Value:    upsert.Value,
+					Metadata: metadata,
 				},
 				Operation: state.Upsert,
 			})
@@ -404,7 +401,8 @@ func (a *actorsRuntime) TransactionalStateOperation(ctx context.Context, req *Tr
 			key := a.constructActorStateKey(req.ActorType, req.ActorID, delete.Key)
 			requests = append(requests, state.TransactionalRequest{
 				Request: state.DeleteRequest{
-					Key: key,
+					Key:      key,
+					Metadata: metadata,
 				},
 				Operation: state.Delete,
 			})
@@ -433,9 +431,14 @@ func (a *actorsRuntime) SaveState(ctx context.Context, req *SaveStateRequest) er
 		return errors.New("actors: state store does not exist or incorrectly configured")
 	}
 	key := a.constructActorStateKey(req.ActorType, req.ActorID, req.Key)
+
+	partitionKey := a.constructCompositeKey(a.config.AppID, req.ActorType, req.ActorID)
+	metadata := map[string]string{metadataPartitionKey: partitionKey}
+
 	err := a.store.Set(&state.SetRequest{
-		Value: req.Value,
-		Key:   key,
+		Value:    req.Value,
+		Key:      key,
+		Metadata: metadata,
 	})
 	return err
 }
@@ -445,6 +448,7 @@ func (a *actorsRuntime) DeleteState(ctx context.Context, req *DeleteStateRequest
 		return errors.New("actors: state store does not exist or incorrectly configured")
 	}
 	key := a.constructActorStateKey(req.ActorType, req.ActorID, req.Key)
+
 	err := a.store.Delete(&state.DeleteRequest{
 		Key: key,
 	})
@@ -641,11 +645,11 @@ func (a *actorsRuntime) drainRebalancedActors() {
 				actor := value.(*actor)
 				if a.config.DrainRebalancedActors {
 					// wait until actor isn't busy or timeout hits
-					if actor.busy {
+					if actor.isBusy() {
 						select {
 						case <-time.After(a.config.DrainOngoingCallTimeout):
 							break
-						case <-actor.busyCh:
+						case <-actor.channel():
 							// if a call comes in from the actor for state changes, that's still allowed
 							break
 						}
@@ -659,7 +663,7 @@ func (a *actorsRuntime) drainRebalancedActors() {
 
 				for {
 					// wait until actor is not busy, then deactivate
-					if !actor.busy {
+					if !actor.isBusy() {
 						err := a.deactivateActor(actorType, actorID)
 						if err != nil {
 							log.Warnf("failed to deactivate actor %s: %s", actorKey, err)

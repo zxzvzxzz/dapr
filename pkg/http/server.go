@@ -7,6 +7,7 @@ package http
 
 import (
 	"fmt"
+	"net/http"
 	"strings"
 
 	cors "github.com/AdhityaRamadhanus/fasthttpcors"
@@ -14,7 +15,9 @@ import (
 	"github.com/dapr/dapr/pkg/logger"
 
 	diag "github.com/dapr/dapr/pkg/diagnostics"
+	diag_utils "github.com/dapr/dapr/pkg/diagnostics/utils"
 	http_middleware "github.com/dapr/dapr/pkg/middleware/http"
+	auth "github.com/dapr/dapr/pkg/runtime/security"
 	routing "github.com/fasthttp/router"
 	"github.com/valyala/fasthttp"
 	"github.com/valyala/fasthttp/pprofhandler"
@@ -47,7 +50,7 @@ func NewServer(api API, config ServerConfig, tracingSpec config.TracingSpec, pip
 // StartNonBlocking starts a new server in a goroutine
 func (s *server) StartNonBlocking() {
 	handler :=
-		s.useProxy(
+		useAPIAuthentication(
 			s.useCors(
 				s.useComponents(
 					s.useRouter())))
@@ -68,12 +71,16 @@ func (s *server) StartNonBlocking() {
 }
 
 func (s *server) useTracing(next fasthttp.RequestHandler) fasthttp.RequestHandler {
-	log.Infof("enabled tracing http middleware")
-	return diag.SetTracingInHTTPMiddleware(next, s.config.AppID, s.tracingSpec)
+	if diag_utils.IsTracingEnabled(s.tracingSpec.SamplingRate) {
+		log.Infof("enabled tracing http middleware")
+		return diag.HTTPTraceMiddleware(next, s.config.AppID, s.tracingSpec)
+	}
+	return next
 }
 
 func (s *server) useMetrics(next fasthttp.RequestHandler) fasthttp.RequestHandler {
 	if diag.DefaultHTTPMonitoring.IsEnabled() {
+		log.Infof("enabled metrics http middleware")
 		return diag.DefaultHTTPMonitoring.FastHTTPMiddleware(next)
 	}
 	return next
@@ -96,29 +103,18 @@ func (s *server) useCors(next fasthttp.RequestHandler) fasthttp.RequestHandler {
 	return corsHandler.CorsMiddleware(next)
 }
 
-func (s *server) useProxy(next fasthttp.RequestHandler) fasthttp.RequestHandler {
-	log.Infof("enabled proxy http middleware")
+func useAPIAuthentication(next fasthttp.RequestHandler) fasthttp.RequestHandler {
+	token := auth.GetAPIToken()
+	if token == "" {
+		return next
+	}
 	return func(ctx *fasthttp.RequestCtx) {
-		var proto string
-		if ctx.IsTLS() {
-			proto = "https"
+		v := ctx.Request.Header.Peek(auth.APITokenHeader)
+		if auth.ExcludedRoute(string(ctx.Request.URI().FullURI())) || string(v) == token {
+			next(ctx)
 		} else {
-			proto = "http"
+			ctx.Error("invalid api token", http.StatusUnauthorized)
 		}
-		// Add Forwarded header: https://tools.ietf.org/html/rfc7239
-		ctx.Request.Header.Add("Forwarded",
-			fmt.Sprintf("by=%s;for=%s;host=%s;proto=%s",
-				ctx.LocalAddr(),
-				ctx.RemoteAddr(),
-				ctx.Host(),
-				proto))
-		// Add X-Forwarded-For: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/X-Forwarded-For
-		ctx.Request.Header.Add("X-Forwarded-For", ctx.RemoteAddr().String())
-		// Add X-Forwarded-Host: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/X-Forwarded-Host
-		ctx.Request.Header.Add("X-Forwarded-Host", fmt.Sprintf("%s", ctx.Host()))
-		// Add X-Forwarded-Proto: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/X-Forwarded-Proto
-		ctx.Request.Header.Add("X-Forwarded-Proto", proto)
-		next(ctx)
 	}
 }
 

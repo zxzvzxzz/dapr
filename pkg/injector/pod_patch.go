@@ -8,13 +8,15 @@ package injector
 import (
 	"encoding/json"
 	"fmt"
+	"path"
 	"strconv"
 	"strings"
 
 	scheme "github.com/dapr/dapr/pkg/client/clientset/versioned"
 	"github.com/dapr/dapr/pkg/credentials"
-	"github.com/dapr/dapr/pkg/runtime"
+	auth "github.com/dapr/dapr/pkg/runtime/security"
 	"github.com/dapr/dapr/pkg/sentry/certs"
+	"github.com/dapr/dapr/utils"
 	"k8s.io/api/admission/v1beta1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -32,6 +34,7 @@ const (
 	appIDKey                          = "dapr.io/id"
 	daprProfilingKey                  = "dapr.io/profiling"
 	daprLogLevel                      = "dapr.io/log-level"
+	daprAPITokenSecret                = "dapr.io/api-token-secret" /* #nosec */
 	daprLogAsJSON                     = "dapr.io/log-as-json"
 	daprMaxConcurrencyKey             = "dapr.io/max-concurrency"
 	daprMetricsPortKey                = "dapr.io/metrics-port"
@@ -47,9 +50,12 @@ const (
 	daprReadinessProbeTimeoutKey      = "dapr.io/sidecar-readiness-probe-timeout-seconds"
 	daprReadinessProbePeriodKey       = "dapr.io/sidecar-readiness-probe-period-seconds"
 	daprReadinessProbeThresholdKey    = "dapr.io/sidecar-readiness-probe-threshold"
+	containersPath                    = "/spec/containers"
 	sidecarHTTPPort                   = 3500
 	sidecarAPIGRPCPort                = 50001
 	sidecarInternalGRPCPort           = 50002
+	userContainerDaprHTTPPortName     = "DAPR_HTTP_PORT"
+	userContainerDaprGRPCPortName     = "DAPR_GRPC_PORT"
 	apiAddress                        = "dapr-api"
 	placementService                  = "dapr-placement"
 	sentryService                     = "dapr-sentry"
@@ -60,7 +66,7 @@ const (
 	defaultLogLevel                   = "info"
 	defaultLogAsJSON                  = false
 	kubernetesMountPath               = "/var/run/secrets/kubernetes.io/serviceaccount"
-	defaultConfig                     = "default"
+	defaultConfig                     = "daprsystem"
 	defaultMetricsPort                = 9090
 	sidecarHealthzPath                = "healthz"
 	defaultHealthzProbeDelaySeconds   = 3
@@ -121,12 +127,14 @@ func (i *injector) getPodPatchOperations(ar *v1beta1.AdmissionReview,
 	}
 
 	patchOps := []PatchOperation{}
+	envPatchOps := []PatchOperation{}
 	var path string
 	var value interface{}
 	if len(pod.Spec.Containers) == 0 {
-		path = "/spec/containers"
+		path = containersPath
 		value = []corev1.Container{*sidecarContainer}
 	} else {
+		envPatchOps = addDaprEnvVarsToContainers(pod.Spec.Containers)
 		path = "/spec/containers/-"
 		value = sidecarContainer
 	}
@@ -139,8 +147,65 @@ func (i *injector) getPodPatchOperations(ar *v1beta1.AdmissionReview,
 			Value: value,
 		},
 	)
+	patchOps = append(patchOps, envPatchOps...)
 
 	return patchOps, nil
+}
+
+// This function add Dapr environment variables to all the containers in any Dapr enabled pod.
+// The containers can be injected or user defined.
+func addDaprEnvVarsToContainers(containers []corev1.Container) []PatchOperation {
+	portEnv := []corev1.EnvVar{
+		{
+			Name:  userContainerDaprHTTPPortName,
+			Value: strconv.Itoa(sidecarHTTPPort),
+		},
+		{
+			Name:  userContainerDaprGRPCPortName,
+			Value: strconv.Itoa(sidecarAPIGRPCPort),
+		},
+	}
+	envPatchOps := []PatchOperation{}
+	for i, container := range containers {
+		path := fmt.Sprintf("%s/%d/env", containersPath, i)
+		patchOps := getEnvPatchOperations(container.Env, portEnv, path)
+		envPatchOps = append(envPatchOps, patchOps...)
+	}
+	return envPatchOps
+}
+
+// This function only add new environment variables if they do not exist.
+// It does not override existing values for those variables if they have been defined already.
+func getEnvPatchOperations(envs []corev1.EnvVar, addEnv []corev1.EnvVar, path string) []PatchOperation {
+	if len(envs) == 0 {
+		// If there are no environment variables defined in the container, we initialize a slice of environment vars.
+		return []PatchOperation{
+			{
+				Op:    "add",
+				Path:  path,
+				Value: addEnv,
+			},
+		}
+	}
+	// If there are existing env vars, then we are adding to an existing slice of env vars.
+	path += "/-"
+
+	var patchOps []PatchOperation
+LoopEnv:
+	for _, env := range addEnv {
+		for _, actual := range envs {
+			if actual.Name == env.Name {
+				// Add only env vars that do not conflict with existing user defined/injected env vars.
+				continue LoopEnv
+			}
+		}
+		patchOps = append(patchOps, PatchOperation{
+			Op:    "add",
+			Path:  path,
+			Value: env,
+		})
+	}
+	return patchOps
 }
 
 func getTrustAnchorsAndCertChain(kubeClient *kubernetes.Clientset, namespace string) (string, string, string) {
@@ -224,6 +289,10 @@ func profilingEnabled(annotations map[string]string) bool {
 	return getBoolAnnotationOrDefault(annotations, daprProfilingKey, false)
 }
 
+func getAPITokenSecret(annotations map[string]string) string {
+	return getStringAnnotationOrDefault(annotations, daprAPITokenSecret, "")
+}
+
 func getBoolAnnotationOrDefault(annotations map[string]string, key string, defaultValue bool) bool {
 	enabled, ok := annotations[key]
 	if !ok {
@@ -267,6 +336,23 @@ func getInt32Annotation(annotations map[string]string, key string) (int32, error
 		return -1, fmt.Errorf("error parsing %s int value %s: %s", key, s, err)
 	}
 	return int32(value), nil
+}
+
+func getProbeHTTPHandler(port int32, pathElements ...string) corev1.Handler {
+	return corev1.Handler{
+		HTTPGet: &corev1.HTTPGetAction{
+			Path: formatProbePath(pathElements...),
+			Port: intstr.IntOrString{IntVal: port},
+		},
+	}
+}
+
+func formatProbePath(elements ...string) string {
+	pathStr := path.Join(elements...)
+	if !strings.HasPrefix(pathStr, "/") {
+		pathStr = fmt.Sprintf("/%s", pathStr)
+	}
+	return pathStr
 }
 
 func appendQuantityToResourceList(quantity string, resourceName corev1.ResourceName, resourceList corev1.ResourceList) (*corev1.ResourceList, error) {
@@ -346,6 +432,8 @@ func getSidecarContainer(annotations map[string]string, id, daprSidecarImage, na
 		log.Warn(err)
 	}
 
+	httpHandler := getProbeHTTPHandler(sidecarHTTPPort, apiVersionV1, sidecarHealthzPath)
+
 	c := &corev1.Container{
 		Name:            sidecarContainerName,
 		Image:           daprSidecarImage,
@@ -371,7 +459,7 @@ func getSidecarContainer(annotations map[string]string, id, daprSidecarImage, na
 		Command: []string{"/daprd"},
 		Env: []corev1.EnvVar{
 			{
-				Name: runtime.HostIPEnvVar,
+				Name: utils.HostIPEnvVar,
 				ValueFrom: &corev1.EnvVarSource{
 					FieldRef: &corev1.ObjectFieldSelector{
 						FieldPath: "status.podIP",
@@ -400,24 +488,14 @@ func getSidecarContainer(annotations map[string]string, id, daprSidecarImage, na
 			"--metrics-port", fmt.Sprintf("%v", metricsPort),
 		},
 		ReadinessProbe: &corev1.Probe{
-			Handler: corev1.Handler{
-				HTTPGet: &corev1.HTTPGetAction{
-					Path: fmt.Sprintf("%s/%s", apiVersionV1, sidecarHealthzPath),
-					Port: intstr.IntOrString{IntVal: sidecarHTTPPort},
-				},
-			},
+			Handler:             httpHandler,
 			InitialDelaySeconds: getInt32AnnotationOrDefault(annotations, daprReadinessProbeDelayKey, defaultHealthzProbeDelaySeconds),
 			TimeoutSeconds:      getInt32AnnotationOrDefault(annotations, daprReadinessProbeTimeoutKey, defaultHealthzProbeTimeoutSeconds),
 			PeriodSeconds:       getInt32AnnotationOrDefault(annotations, daprReadinessProbePeriodKey, defaultHealthzProbePeriodSeconds),
 			FailureThreshold:    getInt32AnnotationOrDefault(annotations, daprReadinessProbeThresholdKey, defaultHealthzProbeThreshold),
 		},
 		LivenessProbe: &corev1.Probe{
-			Handler: corev1.Handler{
-				HTTPGet: &corev1.HTTPGetAction{
-					Path: fmt.Sprintf("%s/%s", apiVersionV1, sidecarHealthzPath),
-					Port: intstr.IntOrString{IntVal: sidecarHTTPPort},
-				},
-			},
+			Handler:             httpHandler,
 			InitialDelaySeconds: getInt32AnnotationOrDefault(annotations, daprLivenessProbeDelayKey, defaultHealthzProbeDelaySeconds),
 			TimeoutSeconds:      getInt32AnnotationOrDefault(annotations, daprLivenessProbeTimeoutKey, defaultHealthzProbeTimeoutSeconds),
 			PeriodSeconds:       getInt32AnnotationOrDefault(annotations, daprLivenessProbePeriodKey, defaultHealthzProbePeriodSeconds),
@@ -457,6 +535,21 @@ func getSidecarContainer(annotations map[string]string, id, daprSidecarImage, na
 				Name:  "SENTRY_LOCAL_IDENTITY",
 				Value: identity,
 			})
+	}
+
+	secret := getAPITokenSecret(annotations)
+	if secret != "" {
+		c.Env = append(c.Env, corev1.EnvVar{
+			Name: auth.APITokenEnvVar,
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					Key: "token",
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: secret,
+					},
+				},
+			},
+		})
 	}
 
 	resources, err := getResourceRequirements(annotations)
